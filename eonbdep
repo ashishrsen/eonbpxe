@@ -1,0 +1,233 @@
+#!/bin/bash
+# One-shot: PXE+iPXE (ISC-DHCP, TFTP, Lighttpd, NFS) + install rc/sc/initboot from your repo
+# Works on Ubuntu/Debian
+
+set -euo pipefail
+
+### ---- CONFIG (edit to fit your network) ----
+PXE_IFACE="eth0"
+PXE_NET="10.20.30.0"
+PXE_MASK="255.255.255.0"
+PXE_IP="10.20.30.1"
+PXE_GW="10.20.30.1"
+PXE_DNS="8.8.8.8"
+PXE_RANGE_START="10.20.30.50"
+PXE_RANGE_END="10.20.30.150"
+
+TFTP_ROOT="/tftpboot"
+
+REPO_URL="https://github.com/ashishrsen/eonbpxe.git"
+REPO_DIR="/opt/eonbpxe"
+
+INSTALL_BIN="/usr/local/bin"           # Change to /bin if you truly need system bin
+TOOL_FILES=("rc" "sc" "initboot")      # Files to install from repo
+### -------------------------------------------
+
+log(){ echo -e "[*] $*"; }
+ok(){ echo -e "[+] $*"; }
+warn(){ echo -e "[!] $*" >&2; }
+
+require_root() {
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    echo "Please run as root (sudo)." >&2
+    exit 1
+  fi
+}
+
+copy_from_repo() {
+  # $1 = pattern (case-insensitive), $2 = dest path
+  local pattern="$1" dest="$2" found=""
+  found="$(find "${REPO_DIR}" -type f -iname "${pattern}" -print -quit || true)"
+  if [ -n "$found" ]; then
+    install -m 0644 "$found" "$dest"
+    ok "Copied $(basename "$found") → $dest"
+    return 0
+  fi
+  return 1
+}
+
+install_tool_from_repo() {
+  # $1 = filename (exact match case-insensitive)
+  local name="$1" src dest
+  src="$(find "$REPO_DIR" -type f -iname "$name" -print -quit || true)"
+  if [ -z "$src" ]; then
+    warn "Tool '$name' not found in repo."
+    return 1
+  fi
+  dest="${INSTALL_BIN}/${name}"
+  install -m 0755 "$src" "$dest"
+  ok "Installed tool: $name → $dest"
+}
+
+main() {
+  require_root
+
+  log "Updating system packages..."
+  apt update -y && apt upgrade -y
+
+  log "Installing required packages..."
+  apt install -y git isc-dhcp-server tftpd-hpa lighttpd nfs-kernel-server ipxe syslinux-common
+
+  log "Preparing ${TFTP_ROOT} directories..."
+  mkdir -p "${TFTP_ROOT}/pxelinux.cfg" \
+           "${TFTP_ROOT}/images" \
+           "${TFTP_ROOT}/os/casper" \
+           "${TFTP_ROOT}/logs"
+  chmod -R 755 "${TFTP_ROOT}"
+
+  # --------- Clone/Pull your repo ----------
+  if [ -d "${REPO_DIR}/.git" ]; then
+    log "Updating repo in ${REPO_DIR} ..."
+    git -C "${REPO_DIR}" pull --ff-only
+  else
+    log "Cloning repo to ${REPO_DIR} ..."
+    rm -rf "${REPO_DIR}"
+    git clone --depth=1 "${REPO_URL}" "${REPO_DIR}"
+  fi
+
+  # --------- Copy iPXE loaders (prefer from repo, fallback to system) ----------
+  need_warn=false
+
+  if ! copy_from_repo "undionly.kpxe" "${TFTP_ROOT}/undionly.kpxe"; then
+    if [ -f /usr/lib/ipxe/undionly.kpxe ]; then
+      install -m 0644 /usr/lib/ipxe/undionly.kpxe "${TFTP_ROOT}/undionly.kpxe"
+      ok "Used system undionly.kpxe"
+    else
+      need_warn=true
+    fi
+  fi
+
+  if ! copy_from_repo "ipxe.efi" "${TFTP_ROOT}/ipxe.efi"; then
+    if [ -f /usr/lib/ipxe/ipxe.efi ]; then
+      install -m 0644 /usr/lib/ipxe/ipxe.efi "${TFTP_ROOT}/ipxe.efi"
+      ok "Used system ipxe.efi"
+    else
+      need_warn=true
+    fi
+  fi
+
+  if ! copy_from_repo "snponly.efi" "${TFTP_ROOT}/snponly.efi"; then
+    [ -f /usr/lib/ipxe/snponly.efi ] && install -m 0644 /usr/lib/ipxe/snponly.efi "${TFTP_ROOT}/snponly.efi" && ok "Used system snponly.efi" || true
+  fi
+
+  $need_warn && warn "Some iPXE loader(s) missing. Ensure your repo or system provides them."
+
+  # Optional PXELINUX bits (fallback utilities)
+  [ -f /usr/lib/PXELINUX/pxelinux.0 ] && install -m 0644 /usr/lib/PXELINUX/pxelinux.0 "${TFTP_ROOT}/pxelinux.0" || true
+  if [ -d /usr/lib/syslinux/modules/bios ]; then
+    cp -f /usr/lib/syslinux/modules/bios/* "${TFTP_ROOT}/" || true
+  fi
+
+  # --------- TFTP (tftpd-hpa) ----------
+  log "Configuring TFTP (tftpd-hpa) ..."
+  cat >/etc/default/tftpd-hpa <<EOF
+TFTP_USERNAME="tftp"
+TFTP_DIRECTORY="${TFTP_ROOT}"
+TFTP_ADDRESS="0.0.0.0:69"
+TFTP_OPTIONS="--secure --create"
+EOF
+
+  # --------- Lighttpd (HTTP) ----------
+  log "Configuring Lighttpd (docroot=${TFTP_ROOT}) ..."
+  cat >/etc/lighttpd/conf-available/10-pxe.conf <<EOF
+server.document-root = "${TFTP_ROOT}"
+dir-listing.activate = "enable"
+mimetype.assign += (
+  ".ipxe" => "text/plain",
+  ".cfg"  => "text/plain"
+)
+index-file.names = ( "index.html", "boot.ipxe" )
+EOF
+  lighttpd-enable-mod pxe >/dev/null 2>&1 || true
+
+  # --------- NFS ----------
+  log "Exporting ${TFTP_ROOT} via NFS (read-only) ..."
+  grep -q "^${TFTP_ROOT} " /etc/exports || echo "${TFTP_ROOT} *(ro,sync,no_subtree_check,root_squash)" >> /etc/exports
+  exportfs -ra
+
+  # --------- ISC-DHCP with global iPXE chainload ----------
+  log "Writing /etc/dhcp/dhcpd.conf ..."
+  cat >/etc/dhcp/dhcpd.conf <<EOF
+default-lease-time 600;
+max-lease-time 7200;
+authoritative;
+
+option arch code 93 = unsigned integer 16;
+
+subnet ${PXE_NET} netmask ${PXE_MASK} {
+  range ${PXE_RANGE_START} ${PXE_RANGE_END};
+  option routers ${PXE_GW};
+  option subnet-mask ${PXE_MASK};
+  option broadcast-address 10.20.30.255;
+  option domain-name-servers ${PXE_DNS};
+  next-server ${PXE_IP};
+
+  # If already iPXE, chain to HTTP script
+  if exists user-class and option user-class = "iPXE" {
+    filename "http://${PXE_IP}/boot.ipxe";
+  } else {
+    # Not yet iPXE: serve loader from TFTP
+    if option arch = 00:07 or option arch = 00:09 or option arch = 00:0b {
+      filename "ipxe.efi";      # UEFI x64/HTTP UEFI/ARM64
+    } else if option arch = 00:06 {
+      filename "ipxe.efi";      # UEFI IA32
+    } else {
+      filename "undionly.kpxe"; # Legacy BIOS
+    }
+  }
+}
+EOF
+
+  # Bind DHCP to PXE interface
+  sed -i "s/^INTERFACESv4=.*/INTERFACESv4=\"${PXE_IFACE}\"/" /etc/default/isc-dhcp-server
+
+  # --------- Create your boot.ipxe + default.ipxe ----------
+  log "Writing ${TFTP_ROOT}/boot.ipxe ..."
+  cat >"${TFTP_ROOT}/boot.ipxe" <<'EOF'
+#!ipxe
+echo EONB is Powered By ExamOnline
+kernel http://10.20.30.1/os/casper/vmlinuz boot=casper ip=dhcp netboot=nfs nfsroot=10.20.30.1:/tftpboot/os
+initrd http://10.20.30.1/os/casper/initrd
+boot
+EOF
+  cp -f "${TFTP_ROOT}/boot.ipxe" "${TFTP_ROOT}/default.ipxe"
+
+  # --------- Install tools rc, sc, initboot into /usr/local/bin ----------
+  log "Installing tools to ${INSTALL_BIN} ..."
+  mkdir -p "${INSTALL_BIN}"
+  fail=0
+  for tool in "${TOOL_FILES[@]}"; do
+    install_tool_from_repo "$tool" || fail=$((fail+1))
+  done
+  [ $fail -gt 0 ] && warn "$fail tool(s) not installed (missing in repo)."
+
+  # --------- Ownership for HTTP (not strictly required for TFTP/NFS ro) ----------
+  chown -R www-data:www-data "${TFTP_ROOT}" || true
+
+  # --------- Firewall (optional) ----------
+  if command -v ufw >/dev/null 2>&1; then
+    log "Opening firewall ports ..."
+    ufw allow 67/udp  >/dev/null 2>&1 || true   # DHCP
+    ufw allow 69/udp  >/dev/null 2>&1 || true   # TFTP
+    ufw allow 80/tcp  >/dev/null 2>&1 || true   # HTTP
+    ufw allow 2049/tcp >/dev/null 2>&1 || true  # NFS
+  fi
+
+  # --------- Restart services ----------
+  log "Restarting services ..."
+  systemctl restart tftpd-hpa
+  systemctl restart lighttpd
+  systemctl restart nfs-kernel-server
+  systemctl restart isc-dhcp-server
+  systemctl enable  tftpd-hpa lighttpd nfs-kernel-server isc-dhcp-server
+
+  ok "All set!
+  • Root for TFTP/HTTP/NFS: ${TFTP_ROOT}
+  • iPXE loaders in ${TFTP_ROOT} (from repo/system)
+  • iPXE script: http://${PXE_IP}/boot.ipxe  (also default.ipxe)
+  • DHCP chainloads iPXE → boot.ipxe
+  • Tools installed: ${TOOL_FILES[*]} → ${INSTALL_BIN}
+  • Put your casper kernel/initrd at: ${TFTP_ROOT}/os/casper/"
+}
+
+main "$@"
